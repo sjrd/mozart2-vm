@@ -53,6 +53,8 @@ private:
   inline
   bool processPair(VM vm, RichNode left, RichNode right);
 
+  void MOZART_NORETURN doSuspend(VM vm);
+
   inline
   void rebind(VM vm, RichNode left, RichNode right);
 
@@ -106,6 +108,28 @@ bool fullPatternMatch(VM vm, RichNode value, RichNode pattern,
 ////////////////////
 
 bool StructuralDualWalk::run(VM vm, RichNode left, RichNode right) {
+  using namespace patternmatching;
+
+  // Fetch back what we already did
+
+  UnstableNode partialLeft;
+  UnstableNode partialRight;
+
+  bool wasPartial =
+    vm->isIntermediateStateAvailable() &&
+    matchesTuple(
+      vm, vm->getIntermediateState(),
+      MOZART_STR("::mozart::StructuralDualWalk"),
+      capture(partialLeft), capture(partialRight));
+
+  if (wasPartial) {
+    left = partialLeft;
+    right = partialRight;
+    vm->getIntermediateState() = build(vm, unit);
+  }
+
+  // The unification loop
+
   MOZART_TRY(vm) {
     /* We put the while inside the try-catch
      * Avoids to install and deinstall the handler on every pair
@@ -165,71 +189,8 @@ bool StructuralDualWalk::run(VM vm, RichNode left, RichNode right) {
   } MOZART_ENDTRY(vm);
 
   // Do we need to suspend on something?
-  if (!suspendTrail.empty()) {
-    // Undo temporary bindings
-
-    undoBindings(vm);
-
-    // Create the control variable
-
-    UnstableNode unstableControlVar = Variable::build(vm);
-    RichNode controlVar = unstableControlVar;
-    controlVar.ensureStable(vm);
-
-    // Reduce the remaining unifications
-    size_t count = suspendTrail.size();
-
-    if (count == 1) {
-      left = *suspendTrail.front().left;
-      right = *suspendTrail.front().right;
-
-      if (left.isTransient()) {
-        DataflowVariable(left).markNeeded(vm);
-        DataflowVariable(left).addToSuspendList(vm, controlVar);
-      }
-
-      if (right.isTransient()) {
-        DataflowVariable(right).markNeeded(vm);
-        DataflowVariable(right).addToSuspendList(vm, controlVar);
-      }
-    } else {
-      UnstableNode label = Atom::build(vm, vm->coreatoms.pipe);
-
-      UnstableNode unstableLeft = Tuple::build(vm, count, label);
-      UnstableNode unstableRight = Tuple::build(vm, count, label);
-
-      auto leftTuple = RichNode(unstableLeft).as<Tuple>();
-      auto rightTuple = RichNode(unstableRight).as<Tuple>();
-
-      size_t i = 0;
-      for (auto iter = suspendTrail.begin();
-           iter != suspendTrail.end(); i++, ++iter) {
-        UnstableNode leftTemp(vm, *iter->left);
-        leftTuple.initElement(vm, i, leftTemp);
-
-        RichNode richLeftTemp = leftTemp;
-        if (richLeftTemp.isTransient()) {
-          DataflowVariable(richLeftTemp).markNeeded(vm);
-          DataflowVariable(richLeftTemp).addToSuspendList(vm, controlVar);
-        }
-
-        UnstableNode rightTemp(vm, *iter->right);
-        rightTuple.initElement(vm, i, rightTemp);
-
-        RichNode richRightTemp = rightTemp;
-        if (richRightTemp.isTransient()) {
-          DataflowVariable(richRightTemp).markNeeded(vm);
-          DataflowVariable(richRightTemp).addToSuspendList(vm, controlVar);
-        }
-      }
-    }
-
-    suspendTrail.clear(vm);
-
-    // TODO Replace initial operands by unstableLeft and unstableRight
-
-    waitFor(vm, controlVar);
-  }
+  if (!suspendTrail.empty())
+    doSuspend(vm);
 
   /* No need to undo temporary bindings here, even if we are in wkEquals mode.
    * In fact, we should not undo them in that case, as that compactifies
@@ -339,6 +300,72 @@ bool StructuralDualWalk::processPair(VM vm, RichNode left, RichNode right) {
       return false;
     }
   }
+}
+
+void StructuralDualWalk::doSuspend(VM vm) {
+  // Undo temporary bindings
+
+  undoBindings(vm);
+
+  // Reduce the remaining unifications, if possible
+
+  size_t count = suspendTrail.size();
+  bool canReduceUnifications =
+    (kind == wkUnify) &&
+    vm->isIntermediateStateAvailable() &&
+    RichNode(vm->getIntermediateState()).is<Unit>();
+
+  if (canReduceUnifications) {
+    if (count == 1) {
+      vm->getIntermediateState() = buildTuple(
+        vm, MOZART_STR("::mozart::StructuralDualWalk"),
+        *suspendTrail.front().left, *suspendTrail.front().right);
+    } else {
+      auto reducedLeft = Tuple::build(vm, count, vm->coreatoms.sharp);
+      auto reducedRight = Tuple::build(vm, count, vm->coreatoms.sharp);
+
+      auto leftElements = RichNode(reducedLeft).as<Tuple>().getElementsArray();
+      auto rightElements = RichNode(reducedRight).as<Tuple>().getElementsArray();
+
+      size_t i = 0;
+      for (auto iter = suspendTrail.begin();
+           iter != suspendTrail.end(); i++, ++iter) {
+        leftElements[i].init(vm, *iter->left);
+        rightElements[i].init(vm, *iter->right);
+      }
+
+      vm->getIntermediateState() = buildTuple(
+        vm, MOZART_STR("::mozart::StructuralDualWalk"),
+        std::move(reducedLeft), std::move(reducedRight));
+    }
+  }
+
+  // Create the control variable
+
+  UnstableNode unstableControlVar = Variable::build(vm);
+  RichNode controlVar = unstableControlVar;
+  controlVar.ensureStable(vm);
+
+  // Wait on all the appropriate vars
+
+  for (auto iter = suspendTrail.begin();
+       iter != suspendTrail.end(); ++iter) {
+    RichNode richLeftTemp = *iter->left;
+    if (richLeftTemp.isTransient()) {
+      DataflowVariable(richLeftTemp).markNeeded(vm);
+      DataflowVariable(richLeftTemp).addToSuspendList(vm, controlVar);
+    }
+
+    RichNode richRightTemp = *iter->right;
+    if (richRightTemp.isTransient()) {
+      DataflowVariable(richRightTemp).markNeeded(vm);
+      DataflowVariable(richRightTemp).addToSuspendList(vm, controlVar);
+    }
+  }
+
+  suspendTrail.clear(vm);
+
+  waitFor(vm, controlVar);
 }
 
 void StructuralDualWalk::rebind(VM vm, RichNode left, RichNode right) {
