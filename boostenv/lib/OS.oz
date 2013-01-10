@@ -32,9 +32,13 @@ functor
 require
    Boot_OS at 'x-oz://boot/OS'
    Boot_Reflection at 'x-oz://boot/Reflection'
+   Boot_Support at 'x-oz://boot/CompilerSupport'
 
 import
    BURL at 'x-oz://boot/URL'
+   Pickle
+   Property
+   Resolve
 
 export
    % Random number generation
@@ -579,6 +583,18 @@ define
    %% Set up a non-stub BURL
 
    local
+      class FileSource
+         feat file
+
+         meth init(File)
+            self.file = File
+         end
+
+         meth read(Size ?Result ?ActualSize)
+            {Fread self.file Size ?Result nil ?ActualSize}
+         end
+      end
+
       fun {BURL_localize URL}
          try
             {Fclose {Fopen URL "rb"}}
@@ -591,9 +607,35 @@ define
       fun {BURL_open URL}
          {CompatOpen URL ['O_RDONLY'] nil}
       end
+
+      fun {BURL_load URL}
+         File = {Fopen URL "rb"}
+         TempResult
+      in
+         try
+            Source = {New FileSource init(File)}
+         in
+            TempResult = {Pickle.readValueFromSource Source}
+         finally
+            {Fclose File}
+         end
+
+         if {IsProcedure TempResult} then {TempResult Base}
+         else TempResult
+         end
+      end
+
+      OzHome = {Property.get 'oz.home'}
+      Handler = {Resolve.handler.pattern "x-oz://system/?{x}.ozf"
+                 {VirtualString.toString OzHome#'/?{x}.ozb'}}
    in
+      {Wait Pickle} % Make sure Pickle is actually loaded before we do this!
+
+      {Resolve.pickle.addHandler back(Handler)}
+
       {Boot_Reflection.become BURL.localize BURL_localize}
       {Boot_Reflection.become BURL.open BURL_open}
+      {Boot_Reflection.become BURL.load BURL_load}
    end
 
 end
